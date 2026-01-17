@@ -410,18 +410,24 @@ def is_dm_keyword(identifier: str) -> bool:
 
 
 def quote_identifier(identifier: str) -> str:
-    """Quote identifier, add double quotes if keyword or contains special characters.
+    """Quote identifier with double quotes for Dameng database.
+    
+    Dameng allows both quoted and unquoted identifiers:
+    - Unquoted: case-insensitive, stored as uppercase
+    - Quoted: case-sensitive, preserves exact case
+    
+    We preserve the original case in quotes to match existing tables
+    that may have been created with mixed case (e.g., 'region', 'user_id', etc.)
     
     Args:
-        identifier: Identifier to quote
+        identifier: Identifier to quote (e.g., 'id', 'region', 'created_at')
         
     Returns:
-        Quoted identifier
+        Quoted identifier preserving the original case
     """
-    # Dameng database uses double quotes for identifiers
-    if is_dm_keyword(identifier) or not identifier.isidentifier():
-        return f'"{identifier.upper()}"'
-    return f'"{identifier.upper()}"'  # Dameng identifiers are uppercase by default
+    # Preserve the original case as provided by ORM
+    # This ensures compatibility with existing tables regardless of their case
+    return f'"{identifier}"'
 
 
 # Data type length and precision mapping
