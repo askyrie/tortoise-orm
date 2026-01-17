@@ -6,14 +6,11 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
-    Coroutine,
     Dict,
     List,
     Optional,
     Tuple,
     TypeVar,
-    Union,
 )
 
 import dmPython
@@ -22,18 +19,13 @@ from pypika_tortoise import Query
 from tortoise.backends.base.client import (
     BaseDBAsyncClient,
     Capabilities,
-    ConnectionWrapper,
-    NestedTransactionContext,
     PoolConnectionWrapper,
-    TransactionContext,
-    TransactionContextPooled,
 )
 from tortoise.exceptions import (
     DBConnectionError,
     DoesNotExist,
     IntegrityError,
     OperationalError,
-    TransactionManagementError,
 )
 from tortoise.log import db_client_logger
 
@@ -43,9 +35,6 @@ from .schema_generator import DmSchemaGenerator
 
 if TYPE_CHECKING:
     from tortoise.models import Model
-
-FuncType = Callable[..., Coroutine[Any, Any, Any]]
-T = TypeVar("T")
 
 logger = db_client_logger
 
