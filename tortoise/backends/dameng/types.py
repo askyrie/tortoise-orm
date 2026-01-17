@@ -209,7 +209,7 @@ TORTOISE_TO_DM_FIELD_MAP: Dict[str, str] = {
     'BooleanField': 'BIT',
     'CharField': 'VARCHAR',
     'DateField': 'DATE',
-    'DatetimeField': 'TIMESTAMP',
+    'DatetimeField': 'TIMESTAMP(6)',  # 明确指定微秒精度
     'DecimalField': 'DECIMAL',
     'FloatField': 'DOUBLE',
     'IntField': 'INT',
@@ -377,8 +377,15 @@ def python_to_dm_type(python_value: Any, dm_type: str) -> Any:
         'DATETIME WITH TIME ZONE', 'TIMESTAMP WITH LOCAL TIME ZONE', 
         'DATETIME WITH LOCAL TIME ZONE'
     ):
+        # dmPython 的 DATETIME/TIMESTAMP 不接受带 tzinfo 的 datetime。
+        # 这里统一把 aware datetime 转成 naive，再交给驱动。
         if isinstance(python_value, datetime.datetime):
-            return python_value
+            if python_value.tzinfo is not None:
+                # 先转换到本地时间（或 UTC），再去掉 tzinfo。
+                # 这里选择保留本地时间值，只去掉 tz 信息，避免时间“看起来跳变”。
+                python_value = python_value.astimezone().replace(tzinfo=None)
+            # 对于达梦数据库，返回格式化的字符串以确保微秒精度
+            return python_value.strftime('%Y-%m-%d %H:%M:%S.%f')
         elif isinstance(python_value, datetime.date):
             return datetime.datetime.combine(python_value, datetime.time())
     
@@ -410,18 +417,24 @@ def is_dm_keyword(identifier: str) -> bool:
 
 
 def quote_identifier(identifier: str) -> str:
-    """Quote identifier, add double quotes if keyword or contains special characters.
+    """Quote identifier with double quotes for Dameng database.
+    
+    Dameng allows both quoted and unquoted identifiers:
+    - Unquoted: case-insensitive, stored as uppercase
+    - Quoted: case-sensitive, preserves exact case
+    
+    We preserve the original case in quotes to match existing tables
+    that may have been created with mixed case (e.g., 'region', 'user_id', etc.)
     
     Args:
-        identifier: Identifier to quote
+        identifier: Identifier to quote (e.g., 'id', 'region', 'created_at')
         
     Returns:
-        Quoted identifier
+        Quoted identifier preserving the original case
     """
-    # Dameng database uses double quotes for identifiers
-    if is_dm_keyword(identifier) or not identifier.isidentifier():
-        return f'"{identifier.upper()}"'
-    return f'"{identifier.upper()}"'  # Dameng identifiers are uppercase by default
+    # Preserve the original case as provided by ORM
+    # This ensures compatibility with existing tables regardless of their case
+    return f'"{identifier}"'
 
 
 # Data type length and precision mapping
