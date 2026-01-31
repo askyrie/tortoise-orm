@@ -3,37 +3,30 @@ from __future__ import annotations
 import asyncio
 import re
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
-    Coroutine,
     Dict,
     List,
     Optional,
     Tuple,
     TypeVar,
-    Union,
 )
 
 import dmPython
-from pypika import Query
+from pypika_tortoise import Query
 
 from tortoise.backends.base.client import (
     BaseDBAsyncClient,
     Capabilities,
-    ConnectionWrapper,
-    NestedTransactionContext,
     PoolConnectionWrapper,
-    TransactionContext,
-    TransactionContextPooled,
 )
 from tortoise.exceptions import (
     DBConnectionError,
     DoesNotExist,
     IntegrityError,
     OperationalError,
-    TransactionManagementError,
 )
 from tortoise.log import db_client_logger
 
@@ -43,9 +36,6 @@ from .schema_generator import DmSchemaGenerator
 
 if TYPE_CHECKING:
     from tortoise.models import Model
-
-FuncType = Callable[..., Coroutine[Any, Any, Any]]
-T = TypeVar("T")
 
 logger = db_client_logger
 
@@ -74,6 +64,7 @@ class DmClient(BaseDBAsyncClient):
         self._connection = None
         self._connection_params = kwargs
         self._pool: Optional[DmConnectionPool] = None
+        self._pool_init_lock = asyncio.Lock()
         self._thread_pool = ThreadPoolExecutor(max_workers=10)
         self._transaction_context: Dict[int, Dict[str, Any]] = {}
         
@@ -162,57 +153,107 @@ class DmClient(BaseDBAsyncClient):
         logger.warning("Dameng database does not support programmatic database deletion")
         raise NotImplementedError("Dameng database does not support programmatic database deletion")
     
-    def acquire_connection(self) -> "DmClient":
-        """Acquire connection - Returns current client instance for compatibility"""
-        return self
+    def acquire_connection(self) -> PoolConnectionWrapper:
+        """Acquire connection from pool with proper wrapper"""
+        return PoolConnectionWrapper(self, self._pool_init_lock)
     
     async def execute_query(
         self, query: str, values: Optional[List[Any]] = None
     ) -> Tuple[int, List[Dict[str, Any]]]:
         """Execute query with connection pooling and error handling"""
-        if not self._pool:
-            await self.create_connection()
-        
-        # Convert parameters using executor method
-        converted_query = self._convert_query_parameters(query) if values else query
-        
         connection = None
         cursor = None
         
         try:
-            # Get connection from pool
-            connection = await self._pool.acquire()
-            cursor = await asyncio.get_event_loop().run_in_executor(None, connection.cursor)
+            # First add schema prefix, then convert parameters
+            query = self._add_schema_prefix(query)
             
-            # Execute query
+            # Convert parameter format from :1, :2 to ? if values are provided
             if values:
-                await asyncio.get_event_loop().run_in_executor(
-                    None, cursor.execute, converted_query, values
-                )
-            else:
-                await asyncio.get_event_loop().run_in_executor(
-                    None, cursor.execute, converted_query
-                )
+                query = self._convert_query_parameters_only(query)
+
+            # Normalize parameters for Dameng driver, especially datetime values.
+            # dmPython 的 DATETIME/TIMESTAMP 列不接受带 tzinfo 的 datetime，这里统一转成 naive datetime
+            # 直接使用字符串格式以确保微秒精度兼容性
+            if values:
+                normalized_values: List[Any] = []
+                for v in values:
+                    if isinstance(v, datetime):
+                        # 如果带时区，先转成本地时间再去掉 tz 信息
+                        if v.tzinfo is not None:
+                            v = v.astimezone().replace(tzinfo=None)
+                        
+                        # 使用格式化字符串，让达梦数据库自己解析时间格式
+                        # 格式: 'YYYY-MM-DD HH:MM:SS.ffffff'
+                        time_str = v.strftime('%Y-%m-%d %H:%M:%S.%f')
+                        normalized_values.append(time_str)
+                    else:
+                        normalized_values.append(v)
+                values = normalized_values
             
-            # Handle results
-            if query.strip().upper().startswith(("SELECT", "WITH", "SHOW", "DESCRIBE", "EXPLAIN")):
-                # Query operations
-                rows = await asyncio.get_event_loop().run_in_executor(None, cursor.fetchall)
-                columns = [desc[0] for desc in cursor.description] if cursor.description else []
-                result = [dict(zip(columns, row)) for row in rows]
-                return len(result), result
-            else:
-                # Modification operations (INSERT, UPDATE, DELETE)
-                rowcount = cursor.rowcount
-                # Commit if not in transaction
-                if not self.in_transaction():
-                    await asyncio.get_event_loop().run_in_executor(None, connection.commit)
-                return rowcount, []
+            # Get connection from pool using context manager pattern
+            async with self.acquire_connection() as connection:
+                def get_cursor():
+                    return connection.cursor()
+                cursor = await asyncio.get_event_loop().run_in_executor(None, get_cursor)
+                
+                # Log query for debugging
+                logger.debug(f"Executing query: {query[:300]}... with values: {values}")
+                
+                # Execute query - dmPython uses execute() for both SELECT and DML
+                if values:
+                    def execute_with_params():
+                        return cursor.execute(query, values)
+                    await asyncio.get_event_loop().run_in_executor(None, execute_with_params)
+                else:
+                    def execute_query_func():
+                        return cursor.execute(query)
+                    await asyncio.get_event_loop().run_in_executor(None, execute_query_func)
+                
+                logger.debug(f"Query executed successfully, rowcount: {cursor.rowcount}")
+                
+                # Handle results BEFORE connection is released
+                if query.strip().upper().startswith(("SELECT", "WITH", "SHOW", "DESCRIBE", "EXPLAIN")):
+                    # Query operations - fetch and process results while cursor is valid
+                    def fetch_all():
+                        return cursor.fetchall()
+                    rows = await asyncio.get_event_loop().run_in_executor(None, fetch_all)
+                    
+                    # Get column names from cursor.description
+                    # Format: (name, type_code, display_size, internal_size, precision, scale, null_ok)
+                    if cursor.description:
+                        # Extract column names, preserving the case returned by the database
+                        columns = [str(desc[0]) for desc in cursor.description]
+                        logger.debug(f"Raw column names from cursor: {columns}")
+                    else:
+                        columns = []
+                    
+                    logger.debug(f"Query returned {len(rows) if rows else 0} rows with columns: {columns}")
+                    
+                    # Convert rows to list of dictionaries
+                    result = []
+                    if rows:
+                        for row in rows:
+                            result.append(dict(zip(columns, row)))
+                    
+                    return len(result), result
+                else:
+                    # Modification operations (INSERT, UPDATE, DELETE)
+                    rowcount = cursor.rowcount
+                    # Commit if not in transaction
+                    if not self.in_transaction():
+                        await asyncio.get_event_loop().run_in_executor(None, connection.commit)
+                    return rowcount, []
                 
         except dmPython.Error as e:
             # dmPython specific error handling
             if connection and not self.in_transaction():
-                await asyncio.get_event_loop().run_in_executor(None, connection.rollback)
+                try:
+                    def rollback_tx():
+                        return connection.rollback()
+                    await asyncio.get_event_loop().run_in_executor(None, rollback_tx)
+                except Exception:
+                    pass
             
             error_msg = str(e)
             error_code = getattr(e, 'code', 0) if hasattr(e, 'code') else 0
@@ -233,7 +274,9 @@ class DmClient(BaseDBAsyncClient):
             # General error handling
             if connection and not self.in_transaction():
                 try:
-                    await asyncio.get_event_loop().run_in_executor(None, connection.rollback)
+                    def rollback_tx():
+                        return connection.rollback()
+                    await asyncio.get_event_loop().run_in_executor(None, rollback_tx)
                 except Exception:
                     pass
             
@@ -244,12 +287,17 @@ class DmClient(BaseDBAsyncClient):
             # Cleanup resources
             if cursor:
                 try:
-                    await asyncio.get_event_loop().run_in_executor(None, cursor.close)
+                    def close_cursor():
+                        return cursor.close()
+                    await asyncio.get_event_loop().run_in_executor(None, close_cursor)
                 except Exception:
                     pass
-            if connection:
-                await self._pool.release(connection)
     
+    async def execute_query_dict(self, query: str, values: Optional[List[Any]] = None) -> List[Dict[str, Any]]:
+        """Execute query and return results as list of dicts - Used for SELECT queries"""
+        _, result = await self.execute_query(query, values)
+        return result
+
     async def execute_insert(self, query: str, values: List[Any]) -> int:
         """Execute insert operation - Returns affected row count"""
         try:
@@ -262,37 +310,42 @@ class DmClient(BaseDBAsyncClient):
     
     async def execute_many(self, query: str, values: List[List[Any]]) -> None:
         """Batch execute with transaction support and error recovery"""
-        if not self._pool:
-            await self.create_connection()
-        
         if not values:
             return
         
-        # Convert parameters
-        converted_query = self._convert_query_parameters(query)
+        # Convert parameter format from :1, :2 to ? if values are provided
+        query = self._convert_query_parameters(query)
         
         connection = None
         cursor = None
         
         try:
-            connection = await self._pool.acquire()
-            cursor = await asyncio.get_event_loop().run_in_executor(None, connection.cursor)
-            
-            # Execute batch operation
-            await asyncio.get_event_loop().run_in_executor(
-                None, cursor.executemany, converted_query, values
-            )
-            
-            # Commit if not in transaction
-            if not self.in_transaction():
-                await asyncio.get_event_loop().run_in_executor(None, connection.commit)
-            
-            logger.debug(f"Batch execution successful, affected {len(values)} records")
+            # Get connection from pool using context manager pattern
+            async with self.acquire_connection() as connection:
+                def get_cursor():
+                    return connection.cursor()
+                cursor = await asyncio.get_event_loop().run_in_executor(None, get_cursor)
+                
+                # Execute batch operation using executedirect for direct execution
+                def execute_batch():
+                    # For executemany, we still need to use execute with parameters
+                    return cursor.executemany(query, values)
+                await asyncio.get_event_loop().run_in_executor(None, execute_batch)
+                
+                # Commit if not in transaction
+                if not self.in_transaction():
+                    def commit_tx():
+                        return connection.commit()
+                    await asyncio.get_event_loop().run_in_executor(None, commit_tx)
+                
+                logger.debug(f"Batch execution successful, affected {len(values)} records")
             
         except Exception as e:
             if connection and not self.in_transaction():
                 try:
-                    await asyncio.get_event_loop().run_in_executor(None, connection.rollback)
+                    def rollback_tx():
+                        return connection.rollback()
+                    await asyncio.get_event_loop().run_in_executor(None, rollback_tx)
                 except Exception:
                     pass
             
@@ -305,11 +358,11 @@ class DmClient(BaseDBAsyncClient):
         finally:
             if cursor:
                 try:
-                    await asyncio.get_event_loop().run_in_executor(None, cursor.close)
+                    def close_cursor():
+                        return cursor.close()
+                    await asyncio.get_event_loop().run_in_executor(None, close_cursor)
                 except Exception:
                     pass
-            if connection:
-                await self._pool.release(connection)
     
     async def execute_script(self, query: str) -> None:
         """Execute SQL script with multi-statement support and transaction handling"""
@@ -436,7 +489,9 @@ class DmClient(BaseDBAsyncClient):
         
         try:
             connection = tx_context['connection']
-            await asyncio.get_event_loop().run_in_executor(None, connection.commit)
+            def commit_tx():
+                return connection.commit()
+            await asyncio.get_event_loop().run_in_executor(None, commit_tx)
             tx_context['committed'] = True
             
             logger.debug(f"Transaction committed successfully - Task ID: {task_id}")
@@ -461,7 +516,9 @@ class DmClient(BaseDBAsyncClient):
         
         try:
             connection = tx_context['connection']
-            await asyncio.get_event_loop().run_in_executor(None, connection.rollback)
+            def rollback_tx():
+                return connection.rollback()
+            await asyncio.get_event_loop().run_in_executor(None, rollback_tx)
             
             logger.debug(f"Transaction rolled back successfully - Task ID: {task_id}")
             
@@ -510,7 +567,52 @@ class DmClient(BaseDBAsyncClient):
         for i, string in enumerate(strings):
             query_with_placeholders = query_with_placeholders.replace(f"__STR_{i}__", string)
         
+        # Add schema prefix to table names if needed
+        query_with_placeholders = self._add_schema_prefix(query_with_placeholders)
+        
         return query_with_placeholders
+    
+    def _convert_query_parameters_only(self, query: str) -> str:
+        """Convert parameter placeholders from :1, :2 format to ? format (without schema prefix)"""
+        # Save all string contents to avoid replacing parameters in strings
+        strings = []
+        string_pattern = re.compile(r"'[^']*'")
+        
+        # Temporarily replace strings with placeholders
+        def save_string(match):
+            strings.append(match.group(0))
+            return f"__STR_{len(strings)-1}__"
+        
+        query_with_placeholders = string_pattern.sub(save_string, query)
+        
+        # Replace parameters
+        query_with_placeholders = DmExecutor.PARAM_PATTERN.sub('?', query_with_placeholders)
+        
+        # Restore strings
+        for i, string in enumerate(strings):
+            query_with_placeholders = query_with_placeholders.replace(f"__STR_{i}__", string)
+        
+        return query_with_placeholders
+    
+    def _add_schema_prefix(self, query: str) -> str:
+        """Add schema prefix to table names for Dameng
+        
+        In Dameng, we may need to explicitly qualify table names with their schema.
+        """
+        schema = self._connection_params.get("database", "SYSDBA")
+        
+        # Only add schema prefix if it's not the default user schema
+        if schema.upper() != self._connection_params.get("user", "SYSDBA").upper():
+            # Pattern to match table names that are NOT already schema-qualified
+            # This will match: FROM "table" but NOT FROM "schema"."table"
+            query = re.sub(
+                r'\b(FROM|INTO|UPDATE|JOIN|LEFT\s+JOIN|RIGHT\s+JOIN|INNER\s+JOIN|CROSS\s+JOIN)\s+"([^"\.]+)"(?!\s*\.\s*")',
+                lambda m: f'{m.group(1)} "{schema}"."{m.group(2)}"',
+                query,
+                flags=re.IGNORECASE
+            )
+        
+        return query
     
     @property
     def database(self) -> str:

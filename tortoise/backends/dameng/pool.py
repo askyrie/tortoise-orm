@@ -179,6 +179,31 @@ class DmConnectionPool:
                 except Exception:
                     pass  # Ignore charset setting failures
             
+            # Set current schema to the specified database/schema
+            # This ensures that tables are created in the correct schema
+            try:
+                cursor = connection.cursor()
+                schema_name = self._config['database']
+                # Try different ways to set the current schema
+                schema_commands = [
+                    f"SET SCHEMA {schema_name}",
+                    f"ALTER SESSION SET CURRENT_SCHEMA = {schema_name}",
+                    f"USE {schema_name}"
+                ]
+                
+                for cmd in schema_commands:
+                    try:
+                        cursor.execute(cmd)
+                        logger.debug(f"Successfully set schema to {schema_name} using: {cmd}")
+                        break
+                    except Exception:
+                        continue
+                
+                cursor.close()
+            except Exception as e:
+                logger.warning(f"Failed to set schema to {self._config['database']}: {e}")
+                # Continue anyway, as the connection might still work
+            
             return connection
             
         except Exception as e:
